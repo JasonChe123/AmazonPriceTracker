@@ -3,7 +3,7 @@
 
 # Local Databases
 *.db
-price_tracker.db
+tracker.db
 
 # Chrome Session Profile
 chrome_profile/
