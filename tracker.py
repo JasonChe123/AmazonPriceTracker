@@ -38,13 +38,32 @@ SHORTENER_DOMAINS = {"amzn.eu", "a.co"}
 
 
 # --- Database Setup ---
-def init_db() -> None:
-    """Initializes tables and performs schema migrations for existing databases."""
+def init_db():
+    """Initializes the SQLite database and handles schema migrations safely."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    os.chmod(DB_PATH, 0o600)
 
-    # Approved users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            title TEXT,
+            last_price TEXT,
+            peak_price TEXT,
+            threshold_pct REAL DEFAULT 0.0,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            price TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS approved_users (
             user_id TEXT PRIMARY KEY,
@@ -54,53 +73,16 @@ def init_db() -> None:
         )
     """)
 
-    # Tracked products table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
-            title TEXT,
-            last_price TEXT,
-            peak_price TEXT,
-            added_by TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Price history table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT,
-            price REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # --- Schema Migrations ---
-    # Ensure peak_price column exists in products
+    # Schema Migration Checks
     cursor.execute("PRAGMA table_info(products)")
-    prod_cols = [col[1] for col in cursor.fetchall()]
-    if "peak_price" not in prod_cols:
-        cursor.execute("ALTER TABLE products ADD COLUMN peak_price TEXT")
+    existing_cols = [col[1] for col in cursor.fetchall()]
 
-    # Ensure url column exists in price_history
-    cursor.execute("PRAGMA table_info(price_history)")
-    history_cols = [col[1] for col in cursor.fetchall()]
-    if "url" not in history_cols:
-        cursor.execute("ALTER TABLE price_history ADD COLUMN url TEXT")
-
-    # Ensure threshold_pct exists in products table
-    cursor.execute("PRAGMA table_info(products)")
-    prod_cols = [col[1] for col in cursor.fetchall()]
-    if "threshold_pct" not in prod_cols:
+    if "threshold_pct" not in existing_cols:
         cursor.execute("ALTER TABLE products ADD COLUMN threshold_pct REAL DEFAULT 0.0")
 
-    if ADMIN_USER_ID:
-        cursor.execute(
-            "INSERT OR IGNORE INTO approved_users (user_id, username, first_name) VALUES (?, ?, ?)",
-            (ADMIN_USER_ID, "Admin", "Jason Che")
-        )
+    if "last_updated" not in existing_cols:
+        cursor.execute("ALTER TABLE products ADD COLUMN last_updated TIMESTAMP")
+        cursor.execute("UPDATE products SET last_updated = CURRENT_TIMESTAMP WHERE last_updated IS NULL")
 
     conn.commit()
     conn.close()
@@ -153,61 +135,51 @@ def parse_numeric_price(price_str: str) -> float:
         return 0.0
 
 
-def save_product(url: str, title: str, price: str, user_id: str) -> dict:
-    """
-    Saves or updates a product in SQLite while strictly preserving
-    existing history, peak prices, and original user tracking metrics.
-    """
+def save_product(url: str, title: str, price_str: str, source: str = "AUTO") -> dict:
+    """Saves/updates a product in SQLite and updates peak price if a new high is reached."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    current_num = parse_numeric_price(price)
-
-    # 1. Check if product already exists in database
     cursor.execute("SELECT last_price, peak_price FROM products WHERE url = ?", (url,))
-    existing = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if existing:
-        old_price_str, existing_peak_str = existing
-        existing_peak_num = parse_numeric_price(existing_peak_str or "")
+    current_num = parse_numeric_price(price_str)
+    is_new_peak = False
 
-        # Preserve or elevate peak price
-        if current_num > existing_peak_num:
-            peak_price_str = price
+    if row:
+        old_last_price, old_peak_price = row[0], row[1]
+        old_peak_num = parse_numeric_price(old_peak_price)
+
+        # Check if price increased beyond previous peak price
+        if current_num > old_peak_num and old_peak_num > 0:
+            new_peak_price = price_str
+            is_new_peak = True
         else:
-            peak_price_str = existing_peak_str or price
+            new_peak_price = old_peak_price if old_peak_num > 0 else price_str
 
         cursor.execute("""
-            UPDATE products 
-            SET title = ?, 
-                last_price = ?, 
-                peak_price = ?, 
-                updated_at = CURRENT_TIMESTAMP
+            UPDATE products
+            SET title = ?, last_price = ?, peak_price = ?, last_updated = CURRENT_TIMESTAMP
             WHERE url = ?
-        """, (title, price, peak_price_str, url))
-
+        """, (title, price_str, new_peak_price, url))
     else:
-        peak_price_str = price
+        old_last_price = price_str
+        old_peak_price = price_str
+        new_peak_price = price_str
         cursor.execute("""
-            INSERT INTO products (url, title, last_price, peak_price, added_by)
-            VALUES (?, ?, ?, ?, ?)
-        """, (url, title, price, price, user_id))
-
-    # Log numeric entry to price_history
-    if current_num > 0:
-        cursor.execute(
-            "INSERT INTO price_history (url, price) VALUES (?, ?)",
-            (url, current_num)
-        )
+            INSERT INTO products (url, title, last_price, peak_price, threshold_pct)
+            VALUES (?, ?, ?, ?, 0.0)
+        """, (url, title, price_str, price_str))
 
     conn.commit()
     conn.close()
 
     return {
-        "title": title,
-        "current_price": price,
-        "peak_price": peak_price_str,
-        "is_existing": existing is not None
+        "current_price": price_str,
+        "last_price": price_str,
+        "peak_price": new_peak_price,
+        "old_peak_price": old_peak_price if row else price_str,
+        "is_new_peak": is_new_peak
     }
 
 
@@ -302,38 +274,60 @@ async def scrape_amazon_price(url: str) -> dict:
 
 # --- Daily Cron Task (Runs once and exits) ---
 async def run_daily_cron_job():
-    """Scrapes products, checks price drop thresholds, and sends notifications."""
+    """Scrapes products, checks price thresholds, and sends updates or a status summary."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Retrieve tracked products along with their stored threshold_pct
     cursor.execute("SELECT url, title, last_price, peak_price, COALESCE(threshold_pct, 0.0) FROM products")
     products = cursor.fetchall()
     conn.close()
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
+    alerts_sent = 0
+    total_checked = len(products)
+
     for url, old_title, old_price, peak_price, threshold_pct in products:
         data = await scrape_amazon_price(url)
         clean_new_price = data["price"]
         clean_title = data["title"] or old_title
 
-        saved_info = save_product(url, clean_title, clean_new_price, "CRON")
+        # Save product & detect if peak price increased
+        save_res = save_product(url, clean_title, clean_new_price, "CRON")
+        is_new_peak = save_res["is_new_peak"]
+        old_peak_price = save_res["old_peak_price"]
 
         current_num = parse_numeric_price(clean_new_price)
-        peak_num = parse_numeric_price(saved_info["peak_price"])
+        peak_num = parse_numeric_price(peak_price)
 
-        # Calculate percentage drop relative to peak price
+        # -------------------------------------------------------------
+        # CASE 1: Price Increased -> NEW PEAK PRICE ALERT
+        # -------------------------------------------------------------
+        if is_new_peak:
+            msg = (
+                f"📈 <b>New Peak Price Alert!</b>\n"
+                f"📌 <b>{html.escape(clean_title)}</b>\n\n"
+                f"🔺 <b>Price Increased:</b> {html.escape(clean_new_price)} (Previous: {html.escape(old_price)})\n"
+                f"🔝 <b>New Peak Price:</b> {html.escape(clean_new_price)} (Old Peak: {html.escape(old_peak_price)})\n\n"
+                f"🔗 <a href='{url}'>Amazon Link</a>"
+            )
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
+            alerts_sent += 1
+            continue
+
+        # -------------------------------------------------------------
+        # CASE 2: Price Dropped or Unchanged -> Apply Threshold Check
+        # -------------------------------------------------------------
         if current_num > 0 and peak_num > 0 and peak_num >= current_num:
             drop_percent = round(((peak_num - current_num) / peak_num) * 100, 1)
         else:
             drop_percent = 0.0
 
-        # Filter out products where current price drop is below requested threshold
+        # Filter out price drops below user-specified threshold
         if threshold_pct > 0 and drop_percent < threshold_pct:
             logging.info(
-                f"Skipped {clean_title}: Drop ({drop_percent}%) is below threshold ({threshold_pct}%)."
+                f"Skipped {clean_title}: Drop ({drop_percent}%) below threshold ({threshold_pct}%)."
             )
             continue
 
@@ -343,12 +337,23 @@ async def run_daily_cron_job():
             f"🔄 <b>Daily Price Update</b>\n"
             f"📌 <b>{html.escape(clean_title)}</b>\n\n"
             f"💰 <b>Current Price:</b> {html.escape(clean_new_price)} (Previous: {html.escape(old_price)})\n"
-            f"📈 <b>Peak Price:</b> {html.escape(saved_info['peak_price'])}\n"
+            f"📈 <b>Peak Price:</b> {html.escape(peak_price)}\n"
             f"📉 <b>Price Drop:</b> {drop_str}\n\n"
             f"🔗 <a href='{url}'>Amazon Link</a>"
         )
 
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
+        alerts_sent += 1
+
+    # -------------------------------------------------------------
+    # CASE 3: No Alerts Triggered -> Confirmation Summary Message
+    # -------------------------------------------------------------
+    if alerts_sent == 0:
+        summary_msg = (
+            f"✅ <b>Daily Price Check Complete</b>\n\n"
+            f"All <b>{total_checked}</b> tracked product(s) were checked successfully. No price drops or peak alerts triggered today."
+        )
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary_msg, parse_mode="HTML")
 
 
 # --- Interactive Telegram Handler ---
