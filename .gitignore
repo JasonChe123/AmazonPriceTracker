@@ -1,0 +1,17 @@
+# Environment Variables (NEVER commit to GitHub)
+.env
+
+# Local Databases
+*.db
+price_tracker.db
+
+# Chrome Session Profile
+chrome_profile/
+
+# Python virtual environment & cache
+.venv/
+__pycache__/
+*.pyc
+
+# Log files
+*.log
