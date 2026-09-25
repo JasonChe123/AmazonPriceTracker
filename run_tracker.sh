@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Navigate to project directory
-cd /home/jasonche/Documents/Git-Repository/AmazonPriceTracker || exit
+# Navigate to script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR" || exit
 
 # Activate virtual environment
 source .venv/bin/activate
