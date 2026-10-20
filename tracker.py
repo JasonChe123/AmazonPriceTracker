@@ -442,17 +442,29 @@ async def scrape_iherb_price(url: str) -> dict:
             await page.wait_for_timeout(3000)
 
             page_text = await page.locator("body").inner_text()
-            if re.search(
+            challenge_pattern = re.compile(
                 r"please\s+confirm\s+your\s+identity|press\s*(?:and|&)\s*hold",
-                page_text,
                 re.IGNORECASE,
-            ):
+            )
+            if challenge_pattern.search(page_text):
                 logging.warning(
-                    "iHerb identity verification challenge detected for %s; price check failed",
+                    "iHerb identity verification challenge detected for %s. "
+                    "You have 20 seconds to complete it manually in the browser window.",
                     url,
                 )
-                await context.close()
-                return {"title": "Identity verification required", "price": "Failed to scrape", "url": url}
+                await page.wait_for_timeout(20_000)
+                page_text = await page.locator("body").inner_text()
+                if challenge_pattern.search(page_text):
+                    logging.warning(
+                        "iHerb identity verification challenge remains for %s; price check failed",
+                        url,
+                    )
+                    await context.close()
+                    return {"title": "Identity verification required", "price": "Failed to scrape", "url": url}
+                logging.info(
+                    "iHerb identity verification page cleared for %s; continuing price check",
+                    url,
+                )
 
             title = "Unknown Product"
             title_selectors = ["#name", "h1"]
