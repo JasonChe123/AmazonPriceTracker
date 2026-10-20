@@ -5,6 +5,8 @@ import html
 import asyncio
 import logging
 import sqlite3
+import json
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -32,6 +34,13 @@ logging.basicConfig(
 ALLOWED_AMAZON_DOMAINS = {
     "amazon.com", "amazon.co.uk", "amazon.de", "amazon.fr", "amazon.it",
     "amazon.es", "amazon.ca", "amazon.co.jp", "amazon.in", "amazon.com.au"
+}
+
+ALLOWED_IHERB_DOMAINS = {
+    "iherb.com", "uk.iherb.com", "au.iherb.com", "ca.iherb.com", "hk.iherb.com",
+    "in.iherb.com", "kr.iherb.com", "my.iherb.com", "nz.iherb.com",
+    "ph.iherb.com", "qa.iherb.com", "sg.iherb.com", "tw.iherb.com",
+    "ae.iherb.com", "gb.iherb.com", "jp.iherb.com", "th.iherb.com"
 }
 
 SHORTENER_DOMAINS = {"amzn.eu", "a.co"}
@@ -225,6 +234,118 @@ def sanitize_amazon_url(raw_url: str) -> Optional[str]:
         return None
 
 
+def sanitize_iherb_url(raw_url: str) -> Optional[str]:
+    """
+    Validates iHerb links and returns a clean canonical iHerb URL.
+    Preserves the full product path including slug and ID, only removing query parameters.
+    """
+    if len(raw_url) > 2000 or not raw_url.startswith(("http://", "https://")):
+        return None
+
+    try:
+        parsed = urlparse(raw_url)
+        domain = parsed.netloc.lower().removeprefix("www.")
+
+        # Verify the domain is an allowed iHerb storefront
+        if domain not in ALLOWED_IHERB_DOMAINS:
+            logging.warning(f"Rejected non-iHerb domain: {domain}")
+            return None
+
+        # Preserve the full path (including slug and ID), just remove query parameters and fragments
+        # This ensures URLs like /pr/slug/ID are kept intact to avoid redirects
+        clean_path = parsed.path
+        if not clean_path:
+            return None
+
+        return f"https://{domain}{clean_path}"
+
+    except Exception as e:
+        logging.error(f"Error parsing iHerb URL {raw_url}: {e}")
+        return None
+
+
+def is_iherb_url(url: str) -> bool:
+    """Check if a URL belongs to iHerb."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().removeprefix("www.")
+        return domain in ALLOWED_IHERB_DOMAINS
+    except:
+        return False
+
+
+def extract_iherb_structured_price(
+    json_ld_scripts: list[str], url: str
+) -> Optional[str]:
+    """Returns the offer price for this product from its JSON-LD metadata."""
+    product_id_match = re.search(r"/(\d+)(?:[/?#]|$)", urlparse(url).path)
+    product_id = product_id_match.group(1) if product_id_match else None
+    products = []
+
+    def collect_products(value):
+        if isinstance(value, dict):
+            product_type = value.get("@type", [])
+            if isinstance(product_type, str):
+                product_type = [product_type]
+            if "Product" in product_type:
+                products.append(value)
+            for nested_value in value.values():
+                collect_products(nested_value)
+        elif isinstance(value, list):
+            for nested_value in value:
+                collect_products(nested_value)
+
+    for script in json_ld_scripts:
+        try:
+            collect_products(json.loads(script))
+        except json.JSONDecodeError:
+            logging.debug("Ignoring invalid iHerb JSON-LD script")
+
+    matching_products = [
+        product for product in products
+        if product_id and (
+            str(product.get("productID", "")) == product_id
+            or urlparse(str(product.get("url", ""))).path.rstrip("/").endswith(f"/{product_id}")
+        )
+    ]
+    if (
+        not matching_products
+        and len(products) == 1
+        and not product_id
+        and not products[0].get("productID")
+        and not products[0].get("url")
+    ):
+        matching_products = products
+
+    currency_symbols = {"GBP": "£", "USD": "$", "EUR": "€", "CAD": "CA$", "AUD": "A$"}
+    for product in matching_products:
+        offers = product.get("offers", [])
+        if isinstance(offers, dict):
+            offers = [offers]
+
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            amount = offer.get("price") or offer.get("lowPrice")
+            if amount is None:
+                continue
+            try:
+                price = Decimal(str(amount))
+            except InvalidOperation:
+                continue
+            if not price.is_finite() or price <= 0:
+                continue
+
+            currency = str(offer.get("priceCurrency", "")).upper()
+            symbol = currency_symbols.get(currency)
+            formatted_price = f"{price:.2f}"
+            return f"{symbol}{formatted_price}" if symbol else (
+                f"{currency} {formatted_price}" if currency else formatted_price
+            )
+
+    return None
+
+
 # --- Playwright Scraper ---
 async def scrape_amazon_price(url: str) -> dict:
     """Scrapes Amazon product title and price using persistent context."""
@@ -272,6 +393,104 @@ async def scrape_amazon_price(url: str) -> dict:
             return {"title": "Error fetching product", "price": "Failed to scrape", "url": url}
 
 
+async def scrape_iherb_price(url: str) -> dict:
+    """Scrapes iHerb product title and price using persistent context."""
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            channel="chrome",
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            # Handle cookie consent dialog - try to click reject buttons
+            try:
+                # Wait a moment for cookie banner to appear
+                await page.wait_for_timeout(2000)
+
+                # Try various cookie consent reject button selectors
+                reject_selectors = [
+                    "button:has-text('Reject')",
+                    "button:has-text('reject')",
+                    "button:has-text('Reject All')",
+                    "button:has-text('reject all')",
+                    "button:has-text('Decline All')",
+                    "#onetrust-reject-all-handler",
+                    ".ot-pc-refuse-all-handler",
+                    "[data-testid='reject-all']",
+                    "button[aria-label*='Reject']",
+                    "button[aria-label*='reject']"
+                ]
+
+                for selector in reject_selectors:
+                    try:
+                        reject_btn = await page.query_selector(selector)
+                        if reject_btn:
+                            await reject_btn.click(timeout=3000)
+                            logging.info(f"Clicked cookie reject button: {selector}")
+                            await page.wait_for_timeout(1000)
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                logging.info(f"No cookie consent dialog found or error handling it: {e}")
+
+            # Wait for page to fully load
+            await page.wait_for_timeout(3000)
+
+            page_text = await page.locator("body").inner_text()
+            if re.search(
+                r"please\s+confirm\s+your\s+identity|press\s*(?:and|&)\s*hold",
+                page_text,
+                re.IGNORECASE,
+            ):
+                logging.warning(
+                    "iHerb identity verification challenge detected for %s; price check failed",
+                    url,
+                )
+                await context.close()
+                return {"title": "Identity verification required", "price": "Failed to scrape", "url": url}
+
+            title = "Unknown Product"
+            title_selectors = ["#name", "h1"]
+            for selector in title_selectors:
+                title_elem = await page.query_selector(selector)
+                if title_elem:
+                    title = (await title_elem.inner_text()).strip()
+                    break
+
+            json_ld_scripts = await page.locator(
+                'script[type="application/ld+json"]'
+            ).all_text_contents()
+            price = extract_iherb_structured_price(json_ld_scripts, url)
+
+            if not price:
+                for selector in (
+                    "#product-price .discount-price:visible",
+                    "#product-price .list-price:visible",
+                ):
+                    price_elem = await page.query_selector(selector)
+                    if price_elem:
+                        price_text = (await price_elem.inner_text()).strip()
+                        if parse_numeric_price(price_text) > 0:
+                            price = price_text.splitlines()[0].strip()
+                            break
+
+            await context.close()
+            if not price:
+                logging.warning(f"No product-specific iHerb price found for {url}")
+                price = "Failed to scrape"
+            return {"title": title, "price": price, "url": url}
+
+        except Exception as e:
+            logging.error(f"iHerb scraper error for {url}: {e}")
+            await context.close()
+            return {"title": "Error fetching product", "price": "Failed to scrape", "url": url}
+
+
 # --- Daily Cron Task (Runs once and exits) ---
 async def run_daily_cron_job():
     """Scrapes products, checks price thresholds, and sends updates or a status summary."""
@@ -287,11 +506,22 @@ async def run_daily_cron_job():
 
     alerts_sent = 0
     total_checked = len(products)
+    scraping_failures = 0
 
     for url, old_title, old_price, peak_price, threshold_pct in products:
-        data = await scrape_amazon_price(url)
+        # Use appropriate scraper based on URL
+        if is_iherb_url(url):
+            data = await scrape_iherb_price(url)
+        else:
+            data = await scrape_amazon_price(url)
         clean_new_price = data["price"]
         clean_title = data["title"] or old_title
+        logging.info("Price checked for %s: %s", url, clean_new_price)
+
+        if parse_numeric_price(clean_new_price) <= 0:
+            logging.warning(f"Skipping price update for {url}: no valid price was scraped")
+            scraping_failures += 1
+            continue
 
         # Save product & detect if peak price increased
         save_res = save_product(url, clean_title, clean_new_price, "CRON")
@@ -305,12 +535,13 @@ async def run_daily_cron_job():
         # CASE 1: Price Increased -> NEW PEAK PRICE ALERT
         # -------------------------------------------------------------
         if is_new_peak:
+            platform = "iHerb" if is_iherb_url(url) else "Amazon"
             msg = (
                 f"📈 <b>New Peak Price Alert!</b>\n"
                 f"📌 <b>{html.escape(clean_title)}</b>\n\n"
                 f"🔺 <b>Price Increased:</b> {html.escape(clean_new_price)} (Previous: {html.escape(old_price)})\n"
                 f"🔝 <b>New Peak Price:</b> {html.escape(clean_new_price)} (Old Peak: {html.escape(old_peak_price)})\n\n"
-                f"🔗 <a href='{url}'>Amazon Link</a>"
+                f"🔗 <a href='{url}'>{platform} Link</a>"
             )
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
             alerts_sent += 1
@@ -333,13 +564,14 @@ async def run_daily_cron_job():
 
         drop_str = f"{drop_percent}%" if drop_percent > 0 else "0% (All-time low / base price)"
 
+        platform = "iHerb" if is_iherb_url(url) else "Amazon"
         msg = (
             f"🔄 <b>Daily Price Update</b>\n"
             f"📌 <b>{html.escape(clean_title)}</b>\n\n"
             f"💰 <b>Current Price:</b> {html.escape(clean_new_price)} (Previous: {html.escape(old_price)})\n"
             f"📈 <b>Peak Price:</b> {html.escape(peak_price)}\n"
             f"📉 <b>Price Drop:</b> {drop_str}\n\n"
-            f"🔗 <a href='{url}'>Amazon Link</a>"
+            f"🔗 <a href='{url}'>{platform} Link</a>"
         )
 
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
@@ -349,10 +581,17 @@ async def run_daily_cron_job():
     # CASE 3: No Alerts Triggered -> Confirmation Summary Message
     # -------------------------------------------------------------
     if alerts_sent == 0:
-        summary_msg = (
-            f"✅ <b>Daily Price Check Complete</b>\n\n"
-            f"All <b>{total_checked}</b> tracked product(s) were checked successfully. No price drops or peak alerts triggered today."
-        )
+        if scraping_failures:
+            summary_msg = (
+                f"⚠️ <b>Daily Price Check Complete</b>\n\n"
+                f"Checked <b>{total_checked}</b> tracked product(s); could not retrieve a valid price "
+                f"for <b>{scraping_failures}</b>. Failed reads were not saved."
+            )
+        else:
+            summary_msg = (
+                f"✅ <b>Daily Price Check Complete</b>\n\n"
+                f"All <b>{total_checked}</b> tracked product(s) were checked successfully. No price drops or peak alerts triggered today."
+            )
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary_msg, parse_mode="HTML")
 
 
@@ -427,7 +666,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         processed_urls = set()
 
         for raw_url in candidate_urls:
-            clean_url = sanitize_amazon_url(raw_url)
+            clean_url = sanitize_amazon_url(raw_url) or sanitize_iherb_url(raw_url)
             if clean_url and clean_url not in processed_urls:
                 processed_urls.add(clean_url)
                 if delete_product_by_url(clean_url):
@@ -473,7 +712,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         processed_urls = set()
 
         for raw_url in candidate_urls:
-            clean_url = sanitize_amazon_url(raw_url)
+            clean_url = sanitize_amazon_url(raw_url) or sanitize_iherb_url(raw_url)
             if clean_url and clean_url not in processed_urls:
                 processed_urls.add(clean_url)
                 if update_product_threshold(clean_url, threshold_val):
@@ -498,14 +737,36 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             )
         return
 
-    # 5. Amazon Link Processing
+    # 5. Amazon/iHerb Link Processing
     if "http" in text:
         extracted_urls = re.findall(r'https?://[^\s]+', text)
         for raw_url in extracted_urls:
+            # Try to sanitize as Amazon URL first
             clean_url = sanitize_amazon_url(raw_url)
+            platform = "Amazon"
+
+            # If not Amazon, try iHerb
+            if not clean_url:
+                clean_url = sanitize_iherb_url(raw_url)
+                platform = "iHerb"
+
             if clean_url:
-                await context.bot.send_message(chat_id=chat_id, text="🔎 Amazon link accepted. Fetching product info...")
-                data = await scrape_amazon_price(clean_url)
+                await context.bot.send_message(chat_id=chat_id, text=f"🔎 {platform} link accepted. Fetching product info...")
+
+                # Use appropriate scraper
+                if platform == "iHerb":
+                    data = await scrape_iherb_price(clean_url)
+                else:
+                    data = await scrape_amazon_price(clean_url)
+
+                logging.info("Price checked for %s: %s", clean_url, data["price"])
+
+                if parse_numeric_price(data["price"]) <= 0:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ Could not retrieve a valid {platform} price. The product was not saved; please try again later."
+                    )
+                    continue
 
                 # Save product and retrieve tracked metrics
                 saved_info = save_product(clean_url, data["title"], data["price"], sender_id)
@@ -533,7 +794,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             else:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Invalid link. Only direct Amazon product links are accepted."
+                    text="❌ Invalid link. Only Amazon and iHerb product links are accepted."
                 )
 
 
@@ -573,7 +834,7 @@ async def send_user_manual(bot: Bot, chat_id: int | str, user_name: str) -> None
     manual_text = (
         f"🎉 <b>Welcome {clean_name}!</b> You are now authorized to use the Amazon Price Tracker.\n\n"
         f"📖 <b>Quick User Manual:</b>\n\n"
-        f"1️⃣ <b>Track a Product:</b> Send any Amazon product link (or mobile app <code>amzn.eu</code> link) directly to the group. The bot will save it and start tracking.\n\n"
+        f"1️⃣ <b>Track a Product:</b> Send any Amazon or iHerb product link (or mobile app <code>amzn.eu</code> link) directly to the group. The bot will save it and start tracking.\n\n"
         f"2️⃣ <b>Set Price Drop Alert:</b> Reply to a product message with a percentage (e.g. <code>10%</code> or <code>15%</code>). You will only get daily alerts when the item drops by at least that percentage.\n\n"
         f"3️⃣ <b>Remove a Product:</b> Reply directly to a product message with <code>delete</code> to remove it from the tracking database.\n\n"
         f"4️⃣ <b>Daily Updates:</b> The bot automatically scans tracked products daily and posts price updates and price drop calculations here."
