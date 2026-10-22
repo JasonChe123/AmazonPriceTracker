@@ -518,7 +518,7 @@ async def run_daily_cron_job():
 
     alerts_sent = 0
     total_checked = len(products)
-    scraping_failures = 0
+    scraping_failures = []
 
     for url, old_title, old_price, peak_price, threshold_pct in products:
         # Use appropriate scraper based on URL
@@ -532,7 +532,7 @@ async def run_daily_cron_job():
 
         if parse_numeric_price(clean_new_price) <= 0:
             logging.warning(f"Skipping price update for {url}: no valid price was scraped")
-            scraping_failures += 1
+            scraping_failures.append((clean_title or old_title or url, url))
             continue
 
         # Save product & detect if peak price increased
@@ -590,20 +590,38 @@ async def run_daily_cron_job():
         alerts_sent += 1
 
     # -------------------------------------------------------------
-    # CASE 3: No Alerts Triggered -> Confirmation Summary Message
+    # Report failed scans, or confirm successful checks when there were no alerts.
     # -------------------------------------------------------------
-    if alerts_sent == 0:
-        if scraping_failures:
-            summary_msg = (
-                f"⚠️ <b>Daily Price Check Complete</b>\n\n"
-                f"Checked <b>{total_checked}</b> tracked product(s); could not retrieve a valid price "
-                f"for <b>{scraping_failures}</b>. Failed reads were not saved."
+    if scraping_failures:
+        header = (
+            f"⚠️ <b>Daily Price Check Complete</b>\n\n"
+            f"Checked <b>{total_checked}</b> tracked product(s); could not retrieve a valid price "
+            f"for <b>{len(scraping_failures)}</b>. Failed reads were not saved:\n\n"
+        )
+        failure_items = [
+            f"• <a href='{html.escape(url, quote=True)}'>{html.escape(title[:200])}</a>"
+            for title, url in scraping_failures
+        ]
+
+        # Keep each Telegram message below its 4096-character limit.
+        message_body = header
+        for item in failure_items:
+            if len(message_body) + len(item) + 1 > 4000:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID, text=message_body, parse_mode="HTML"
+                )
+                message_body = header + item + "\n"
+            else:
+                message_body += item + "\n"
+        if message_body:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, text=message_body, parse_mode="HTML"
             )
-        else:
-            summary_msg = (
-                f"✅ <b>Daily Price Check Complete</b>\n\n"
-                f"All <b>{total_checked}</b> tracked product(s) were checked successfully. No price drops or peak alerts triggered today."
-            )
+    elif alerts_sent == 0:
+        summary_msg = (
+            f"✅ <b>Daily Price Check Complete</b>\n\n"
+            f"All <b>{total_checked}</b> tracked product(s) were checked successfully. No price drops or peak alerts triggered today."
+        )
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary_msg, parse_mode="HTML")
 
 
